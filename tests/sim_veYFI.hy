@@ -2,6 +2,9 @@
         vyper.utils [checksum_encode]
         time [time])
 
+(require
+  hyrule [->])
+
 (setv _t (time))
 
 (defn timeit [msg]
@@ -59,7 +62,8 @@
 
 (YFI.mint MILKY (** 10 21))
 (YFI.transfer DOGGIE (** 10 18))
-(YFI.transfer MILKY (* 3 (** 10 18)))
+(YFI.transfer MILKY (-> (** 10 18)
+                        (* 3)))
 (YFI.transfer POOLPI (** 10 18))
 
 (for [t parties]
@@ -77,9 +81,16 @@
 
 (let [timestamp boa.env.vm.patch.timestamp
       4y_lock (+ timestamp MAX_LOCK_DURATION)
-      6y_lock (int (+ timestamp (* 6 (/ MAX_LOCK_DURATION 4))))
-      early_exit (int (+ timestamp (* 3 (/ MAX_LOCK_DURATION 4))))
-      2y_lock (+ timestamp (// MAX_LOCK_DURATION 2))]
+      6y_lock (-> (/ MAX_LOCK_DURATION 4)
+                  (* 6)
+                  (+ timestamp)
+                  (int))
+      early_exit (-> (/ MAX_LOCK_DURATION 4)
+                     (* 3)
+                     (+ timestamp)
+                     (int))
+      2y_lock (-> (// MAX_LOCK_DURATION 2)
+                  (+ timestamp))]
   (veYFI.modify_lock (** 10 18) 4y_lock BUNNY)
   (with [(boa.env.prank MILKY)] (veYFI.modify_lock (** 10 18) 6y_lock MILKY))
   (with [(boa.env.prank POOLPI)] (veYFI.modify_lock (** 10 18) early_exit POOLPI))
@@ -96,12 +107,20 @@
                WEEK)]
   (warp_week)
   (veYFI.checkpoint)
-  (when (and (!= 0 (get (veYFI.locked POOLPI) 1))
-           (> i (int (// (+ START_TIME YEAR) 4))))
+  (when (and (-> (veYFI.locked POOLPI)
+                 (get 1)
+                 (!= 0))
+             (> i (-> (+ START_TIME YEAR)
+                      (// 4)
+                      (int))))
       (with [(boa.env.prank POOLPI)]
         (veYFI.withdraw)))
-  (when (and (= (** 10 18) (get (veYFI.locked MILKY) 0))
-             (> i (int (+ START_TIME (* .5 YEAR)))))
+  (when (and (-> (veYFI.locked MILKY)
+                 (get 0)
+                 (= (** 10 18)))
+             (> i (-> (* .5 YEAR)
+                      (+ START_TIME)
+                      (int))))
       (with [(boa.env.prank MILKY)]
         (veYFI.modify_lock (** 10 18) (+ START_TIME (* 5 YEAR))))))
 
