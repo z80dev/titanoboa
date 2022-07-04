@@ -84,11 +84,11 @@
       6y_lock (-> (/ MAX_LOCK_DURATION 4)
                   (* 6)
                   (+ timestamp)
-                  (int))
+                  int)
       early_exit (-> (/ MAX_LOCK_DURATION 4)
                      (* 3)
                      (+ timestamp)
-                     (int))
+                     int)
       2y_lock (-> (// MAX_LOCK_DURATION 2)
                   (+ timestamp))]
   (veYFI.modify_lock (** 10 18) 4y_lock BUNNY)
@@ -112,7 +112,7 @@
                  (!= 0))
              (> i (-> (+ START_TIME YEAR)
                       (// 4)
-                      (int))))
+                      int)))
       (with [(boa.env.prank POOLPI)]
         (veYFI.withdraw)))
   (when (and (-> (veYFI.locked MILKY)
@@ -120,7 +120,7 @@
                  (= (** 10 18)))
              (> i (-> (* .5 YEAR)
                       (+ START_TIME)
-                      (int))))
+                      int)))
       (with [(boa.env.prank MILKY)]
         (veYFI.modify_lock (** 10 18) (+ START_TIME (* 5 YEAR))))))
 
