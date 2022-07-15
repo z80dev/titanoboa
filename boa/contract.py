@@ -1,3 +1,5 @@
+# TODO maybe move me to boa/vyper/
+
 import contextlib
 import copy
 import textwrap
@@ -20,6 +22,7 @@ from vyper.semantics.validation.utils import get_exact_type_from_node
 from vyper.utils import abi_method_id, cached_property
 
 from boa.env import Env
+from boa.vyper.decoder_utils import decode_vyper_object
 
 
 # build a reverse map from the format we have in pc_pos_map to AST nodes
@@ -48,14 +51,21 @@ class lrudict(dict):
         super().__setitem__(k, val)
 
 
-class VyperContract:
-    _initialized = False
-
-    def __init__(self, compiler_data, *args, env=None, override_address=None):
+class VyperDeployer:
+    def __init__(self, compiler_data):
         self.compiler_data = compiler_data
 
-        global_ctx = compiler_data.global_ctx
-        self.global_ctx = global_ctx
+    def deploy(self, *args, **kwargs):
+        return VyperContract(self.compiler_data, *args, **kwargs)
+
+    def deploy_as_factory(self, *args, **kwargs):
+        return VyperFactory(self.compiler_data, *args, **kwargs)
+
+
+# a few lines of shared code between VyperFactory and VyperContract
+class _T:
+    def __init__(self, compiler_data, env=None, override_address=None):
+        self.compiler_data = compiler_data
 
         if env is None:
             env = Env.get_singleton()
@@ -66,9 +76,55 @@ class VyperContract:
         else:
             self.address = override_address
 
+
+# create a factory for use with `create_from_factory`.
+# uses a ERC5202 preamble, when calling `create_from_factory` will
+# need to use `code_offset=3`
+class VyperFactory:
+    def __init__(
+        self,
+        compiler_data,
+        env=None,
+        override_address=None,
+        factory_preamble=b"\xFE\x71\x00",
+    ):
+        # note slight code duplication with VyperContract ctor,
+        # maybe use common base class?
+        super().__init__(compiler_data, env, override_address)
+
+        if factory_preamble is None:
+            factory_preamble = b""
+
+        factory_bytecode = factory_preamble + compiler_data.bytecode
+
+        # the length of the deployed code in bytes
+        len_bytes = len(factory_bytecode).to_bytes(2, "big")
+        deploy_bytecode = b"\x61" + len_bytes + b"\x3d\x81\x60\x0a\x3d\x39\xf3"
+
+        deploy_bytecode += factory_bytecode
+
+        self.bytecode = self.env.deploy_code(
+            bytecode=deploy_bytecode, deploy_to=self.address
+        )
+
+
+class FrameDetail(dict):
+    def __init__(self, fn_name, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fn_name = fn_name
+
+    def __repr__(self):
+        detail = ", ".join(f"{k}={v}" for (k, v) in self.items())
+        return f"<{self.fn_name}: {detail}>"
+
+
+class VyperContract(_T):
+    def __init__(self, compiler_data, *args, env=None, override_address=None):
+        super().__init__(compiler_data, env, override_address)
+
         encoded_args = b""
 
-        fns = {fn.name: fn for fn in global_ctx._function_defs}
+        fns = {fn.name: fn for fn in self.global_ctx._function_defs}
 
         if "__init__" in fns:
             ctor = VyperFunction(fns.pop("__init__"), self)
@@ -83,16 +139,35 @@ class VyperContract:
         for fn in fns.values():
             setattr(self, fn.name, VyperFunction(fn, self))
 
-        self._computation = None
-
         self._eval_cache = lrudict(0x1000)
-        self._initialized = True
-
         self._source_map = None
+        self._computation = None
+        self._fn = None
 
     @cached_property
     def ast_map(self):
         return ast_map_of(self.compiler_data.vyper_module)
+
+    def debug_frame(self):
+        if self._fn is None:
+            raise Exception("No frame available")
+
+        frame_info = self._fn.fn_signature.frame_info
+
+        mem = self._computation._memory
+        frame_detail = FrameDetail(self._fn.fn_signature.name)
+        for k, v in frame_info.frame_vars.items():
+            if v.location.name != "memory":
+                continue
+            ofst = v.pos
+            size = v.typ.memory_bytes_required
+            frame_detail[k] = decode_vyper_object(mem.read(ofst, size), v.typ)
+
+        return frame_detail
+
+    @property
+    def global_ctx(self):
+        return self.compiler_data.global_ctx
 
     @property
     def source_map(self):
@@ -162,6 +237,7 @@ class VyperContract:
         self._source_map = source_map
 
         c = self._run_bytecode(bytecode)
+        self._fn = None
 
         return self.marshal_to_python(c, typ)
 
@@ -296,13 +372,12 @@ class VyperFunction:
         self.contract = contract
         self.env = contract.env
 
-        # could be cached_property
-        self.fn_signature = FunctionSignature.from_definition(
-            fn_ast, contract.global_ctx
-        )
-
     def __repr__(self):
         return repr(self.fn_ast)
+
+    @cached_property
+    def fn_signature(self):
+        return self.contract.compiler_data.function_signatures[self.fn_ast.name]
 
     # hotspot, cache the signature computation
     def args_abi_type(self, num_kwargs):
@@ -350,6 +425,7 @@ class VyperFunction:
         )
 
         typ = self.fn_signature.return_type
+        self.contract._fn = self
         return self.contract.marshal_to_python(computation, typ)
 
 
