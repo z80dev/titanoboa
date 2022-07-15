@@ -22,6 +22,8 @@ dependencies = [
     "eth-typing",
 ]
 
+[build-system]
+requires = ["setuptools", "wheel"]
 
 [tool.setuptools.packages.find]
 include = ["boa*"]
