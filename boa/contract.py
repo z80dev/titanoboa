@@ -9,7 +9,6 @@ from typing import Any
 import eth_abi as abi
 import vyper
 import vyper.ast as vy_ast
-import vyper.codegen.module as mod
 import vyper.ir.compile_ir as compile_ir
 import vyper.semantics.namespace as vy_ns
 import vyper.semantics.validation as validation
@@ -18,15 +17,18 @@ from vyper.ast.signatures.function_signature import FunctionSignature
 from vyper.ast.utils import parse_to_ast
 from vyper.codegen.core import calculate_type_for_external_return, getpos
 from vyper.codegen.function_definitions.common import generate_ir_for_function
+import vyper.compiler.output as compiler_output
+from vyper.ir.optimizer import optimize
 from vyper.codegen.ir_node import IRnode
-from vyper.codegen.types.types import TupleType
+from vyper.codegen.module import parse_external_interfaces
+from vyper.codegen.types.types import MappingType, TupleType
 from vyper.exceptions import InvalidType, VyperException
 from vyper.semantics.validation.data_positions import set_data_positions
 from vyper.semantics.validation.utils import get_exact_type_from_node
 from vyper.utils import abi_method_id, cached_property
 
-from boa.env import AddressT, Env
-from boa.vyper.decoder_utils import decode_vyper_object
+from boa.env import AddressT, Env, to_int
+from boa.vyper.decoder_utils import ByteAddressableStorage, decode_vyper_object
 
 
 # build a reverse map from the format we have in pc_pos_map to AST nodes
@@ -40,6 +42,10 @@ def ast_map_of(ast_node):
 
 # error messages for external calls
 EXTERNAL_CALL_ERRORS = ("external call failed", "returndatasize too small")
+
+
+# id used internally for method id name
+_METHOD_ID_VAR = "_calldata_method_id"
 
 
 class lrudict(dict):
@@ -66,8 +72,8 @@ class VyperDeployer:
     def deploy(self, *args, **kwargs):
         return VyperContract(self.compiler_data, *args, **kwargs)
 
-    def deploy_as_factory(self, *args, **kwargs):
-        return VyperFactory(self.compiler_data, *args, **kwargs)
+    def deploy_as_blueprint(self, *args, **kwargs):
+        return VyperBlueprint(self.compiler_data, *args, **kwargs)
 
     def at(self, address: AddressT) -> "VyperContract":
         address = to_checksum_address(address)
@@ -81,7 +87,7 @@ class VyperDeployer:
         return ret
 
 
-# a few lines of shared code between VyperFactory and VyperContract
+# a few lines of shared code between VyperBlueprint and VyperContract
 class _BaseContract:
     def __init__(self, compiler_data, env=None, override_address=None):
         self.compiler_data = compiler_data
@@ -96,31 +102,31 @@ class _BaseContract:
             self.address = override_address
 
 
-# create a factory for use with `create_from_factory`.
-# uses a ERC5202 preamble, when calling `create_from_factory` will
+# create a blueprint for use with `create_from_blueprint`.
+# uses a ERC5202 preamble, when calling `create_from_blueprint` will
 # need to use `code_offset=3`
-class VyperFactory(_BaseContract):
+class VyperBlueprint(_BaseContract):
     def __init__(
         self,
         compiler_data,
         env=None,
         override_address=None,
-        factory_preamble=b"\xFE\x71\x00",
+        blueprint_preamble=b"\xFE\x71\x00",
     ):
         # note slight code duplication with VyperContract ctor,
         # maybe use common base class?
         super().__init__(compiler_data, env, override_address)
 
-        if factory_preamble is None:
-            factory_preamble = b""
+        if blueprint_preamble is None:
+            blueprint_preamble = b""
 
-        factory_bytecode = factory_preamble + compiler_data.bytecode
+        blueprint_bytecode = blueprint_preamble + compiler_data.bytecode
 
         # the length of the deployed code in bytes
-        len_bytes = len(factory_bytecode).to_bytes(2, "big")
+        len_bytes = len(blueprint_bytecode).to_bytes(2, "big")
         deploy_bytecode = b"\x61" + len_bytes + b"\x3d\x81\x60\x0a\x3d\x39\xf3"
 
-        deploy_bytecode += factory_bytecode
+        deploy_bytecode += blueprint_bytecode
 
         self.bytecode = self.env.deploy_code(
             bytecode=deploy_bytecode, deploy_to=self.address
@@ -142,6 +148,80 @@ class StackTrace(list):
         return "\n".join(repr(x) for x in self)
 
 
+def unwrap_storage_key(sha3_db, k):
+    path = []
+
+    def unwrap(k):
+        if k in sha3_db:
+            preimage = sha3_db[k]
+            slot, k = preimage[:32], preimage[32:]
+
+            path.append(slot)
+            unwrap(k)
+
+        else:
+            path.append(k)
+
+    unwrap(k)
+    return path
+
+
+def setpath(lens, path, val):
+    for i, k in enumerate(path):
+        if i == len(path) - 1:
+            lens[k] = val
+        else:
+            lens = lens.setdefault(k, {})
+
+
+class VarModel:
+    def __init__(self, contract, slot, typ):
+        self.contract = contract
+        self.addr = to_canonical_address(self.contract.address)
+        self.accountdb = contract.env.vm.state._account_db
+        self.slot = slot
+        self.typ = typ
+
+    def _decode(self, slot, typ):
+        fakemem = ByteAddressableStorage(self.accountdb, self.addr, slot)
+        return decode_vyper_object(fakemem, typ)
+
+    def get(self):
+        if isinstance(self.typ, MappingType):
+            ret = {}
+            for k in self.contract.env.sstore_trace.get(self.contract.address, {}):
+                path = unwrap_storage_key(self.contract.env.sha3_trace, k)
+                if to_int(path[0]) != self.slot:
+                    continue
+
+                path = path[1:]
+
+                ty = self.typ
+                for i, p in enumerate(path):
+                    path[i] = decode_vyper_object(memoryview(p), ty.keytype)
+                    ty = ty.valuetype
+
+                val = self._decode(to_int(k), ty)
+
+                if val:
+                    setpath(ret, path, val)
+            return ret
+
+        else:
+            return self._decode(self.slot, self.typ)
+
+
+# data structure to represent the storage variables in a contract
+class StorageModel:
+    def __init__(self, contract):
+        compiler_data = contract.compiler_data
+        for k, v in compiler_data.global_ctx._globals.items():
+            is_storage = not v.is_immutable
+            if is_storage:  # check that v
+                slot = compiler_data.storage_layout["storage_layout"][k]["slot"]
+                setattr(self, k, VarModel(contract, slot, v.typ))
+
+
 class VyperContract(_BaseContract):
     def __init__(
         self, compiler_data, *args, env=None, override_address=None, skip_init=False
@@ -159,6 +239,8 @@ class VyperContract(_BaseContract):
 
         for fn in fns.values():
             setattr(self, fn.name, VyperFunction(fn, self))
+
+        self._storage = StorageModel(self)
 
         self._eval_cache = lrudict(0x1000)
         self._source_map = None
@@ -207,7 +289,7 @@ class VyperContract(_BaseContract):
 
         node = self.find_source_of(computation.code)
         if node is None:
-            raise Exception("No frame available")
+            return None
 
         fn = node.get_ancestor(vy_ast.FunctionDef)
 
@@ -250,21 +332,6 @@ class VyperContract(_BaseContract):
                 return self.ast_map[pc_map[pc]]
 
         return None
-
-    # run a bytecode fragment in the context of the contract,
-    # maintaining PCs and CODESIZE semantics
-    def _run_bytecode(self, fragment: bytes, calldata_bytes: bytes = b"") -> Any:
-        bytecode = self.unoptimized_bytecode + fragment
-        fake_codesize = len(self.unoptimized_bytecode)
-        method_id = b"dbug"  # note the value doesn't get validated
-        computation = self.env.execute_code(
-            to_address=self.address,
-            bytecode=bytecode,
-            data=method_id + calldata_bytes,
-            fake_codesize=fake_codesize,
-            start_pc=fake_codesize,
-        )
-        return computation
 
     def marshal_to_python(self, computation, vyper_typ):
         self._computation = computation  # for further inspection
@@ -312,9 +379,10 @@ class VyperContract(_BaseContract):
                 error_msg = str(VyperException(error_msg, ast_source))
 
             frame_detail = c.debug_frame(computation)
-            frame_detail.fn_name = "locals"  # override the displayed name
-            if len(frame_detail) > 0:
-                error_msg += f" {frame_detail}"
+            if frame_detail is not None:
+                frame_detail.fn_name = "locals"  # override the displayed name
+                if len(frame_detail) > 0:
+                    error_msg += f" {frame_detail}"
 
         raise BoaError(error_msg)
 
@@ -334,13 +402,21 @@ class VyperContract(_BaseContract):
 
     # eval vyper code in the context of this contract
     def eval(self, stmt: str) -> Any:
-        bytecode, source_map, typ = self.compile_stmt(stmt)
+        tmp = self._source_map
 
+        bytecode, source_map, typ = self.compile_stmt(stmt)
         self._source_map = source_map
 
-        c = self._run_bytecode(bytecode)
+        method_id = b"dbug"  # note dummy method id, doesn't get validated
+        c = self.env.execute_code(
+            to_address=self.address, bytecode=bytecode, data=method_id
+        )
 
-        return self.marshal_to_python(c, typ)
+        ret = self.marshal_to_python(c, typ)
+
+        self._source_map = tmp  # restore
+
+        return ret
 
     @cached_property
     def _ast_module(self):
@@ -382,9 +458,11 @@ class VyperContract(_BaseContract):
         finally:
             self._vyper_namespace["self"].members.pop("__boa_debug__", None)
 
+    # for eval(), we need unoptimized assembly, since the dead code
+    # eliminator might prune a dead function (which we want to eval)
     @cached_property
     def unoptimized_assembly(self):
-        _, runtime, _ = mod.generate_ir_for_module(self.global_ctx)
+        runtime = self.compiler_data.ir_runtime
         return compile_ir.compile_to_assembly(runtime, no_optimize=True)
 
     @cached_property
@@ -394,7 +472,10 @@ class VyperContract(_BaseContract):
     @cached_property
     def data_section(self):
         # extract the data section from the bytecode
-        return self.bytecode[: -self.data_section_size]
+        if self.data_section_size:
+            return self.bytecode[-self.data_section_size :]
+        else:
+            return b""
 
     @cached_property
     def unoptimized_bytecode(self):
@@ -454,32 +535,41 @@ class VyperContract(_BaseContract):
 
         sigs = {"self": self.compiler_data.function_signatures}
         ir = generate_ir_for_function(ast, sigs, self.global_ctx, False)
-
         # generate bytecode where selector check always succeeds
         ir = IRnode.from_list(
-            ["with", "_calldata_method_id", abi_method_id(sig.base_signature), ir]
+            ["with", _METHOD_ID_VAR, abi_method_id(sig.base_signature), ir]
         )
 
-        assembly = compile_ir.compile_to_assembly(ir)
+        # skip optimizing; we will optimize a couple lines down anyway
+        assembly = compile_ir.compile_to_assembly(ir, no_optimize=True)
 
-        # add original bytecode in so that jumpdests in the fragment
+        # add original assembly in so that jumpdests in the fragment
         # assemble correctly in final bytecode
-        # note this is somewhat kludgy, would be better to be able to
-        # pass around the assembly "symbol table"
-        vyper_signature_len = len("\xa1\x65vyper\x83\x00\x03\x04")
-        # we need to use unoptimized assembly of the contract because
-        # otherwise dead code eliminator can strip unused internal functions
-        assembly = self.unoptimized_assembly + ["POP"] * vyper_signature_len + assembly
+        # note this is somewhat kludgy
+        assembly.extend(self.unoptimized_assembly)
 
-        n_padding = len(self.unoptimized_bytecode)
+        # note: optimize_assembly optimizes in place.
+        compile_ir._optimize_assembly(assembly)
+
         bytecode, source_map = compile_ir.assembly_to_evm(assembly)
-        bytecode = bytecode[n_padding:]
 
-        # return the source_map since the evaluator might want
-        # the error map for this stmt
+        # tack on the data section
+        bytecode += self.data_section
+
+        # return the bytecode and other artifacts associated with
+        # this build
         ret = bytecode, source_map, typ
         self._eval_cache[source_code] = ret
         return ret
+
+    @cached_property
+    def _sigs(self):
+        sigs = {}
+        global_ctx = self.compiler_data.global_ctx
+        if global_ctx._contracts or global_ctx._interfaces:
+            sigs = parse_external_interfaces(sigs, global_ctx)
+        sigs["self"] = self.compiler_data.function_signatures
+        return sigs
 
 
 # inherit from VyperException for pretty tracebacks
@@ -499,6 +589,29 @@ class VyperFunction:
     @cached_property
     def fn_signature(self):
         return self.contract.compiler_data.function_signatures[self.fn_ast.name]
+
+    @cached_property
+    def ir(self):
+        # patch compiler_data to have IR for every function
+        sigs = self.contract._sigs
+        global_ctx = self.contract.global_ctx
+
+        ir = generate_ir_for_function(self.fn_ast, sigs, global_ctx, False)
+        return optimize(ir)
+
+    @cached_property
+    def assembly(self):
+        ir = IRnode.from_list(["with", _METHOD_ID_VAR, ["shr", 224, ["calldataload", 0]], self.ir])
+        return compile_ir.compile_to_assembly(ir)
+
+    @cached_property
+    def opcodes(self):
+        return compiler_output._build_opcodes(self.bytecode)
+
+    @cached_property
+    def bytecode(self):
+        bytecode, _ = compile_ir.assembly_to_evm(self.assembly)
+        return bytecode
 
     # hotspot, cache the signature computation
     def args_abi_type(self, num_kwargs):

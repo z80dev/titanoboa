@@ -20,6 +20,13 @@ Titanoboa (/tiˌtɑːnoʊˈboʊə/) is an extinct genus of very large snakes tha
 
 ## Usage
 
+### Hello, world
+
+```python
+import boa
+boa.eval("empty(uint256)")
+```
+
 ### Basic
 ```vyper
 # simple.vy
@@ -56,16 +63,26 @@ def foo() -> uint256:
     1000000000000000000
 ```
 
-### As a factory
+### As a blueprint
 
 ```python
 >>> import boa
 >>> s = boa.load_partial("examples/ERC20.vy")
->>> factory = s.deploy_as_factory()
->>> deployer = boa.load("examples/deployer.vy", factory)
+>>> blueprint = s.deploy_as_blueprint()
+>>> deployer = boa.load("examples/deployer.vy", blueprint)
 >>> token = s.at(deployer.create_new_erc20("token", "TKN", 18, 10**18))
 >>> token.totalSupply()
 >>> 1000000000000000000000000000000000000
+```
+
+### Expecting BoaErrors
+```python
+>>> import boa
+>>> erc20 = boa.load("examples/ERC20.vy", "titanoboa", "boa", 18, 0)
+>>> with boa.env.prank(boa.env.generate_address()):
+...     with boa.reverts():
+...         erc20.mint(boa.env.eoa, 100)  # non-minter cannot mint
+...
 ```
 
 ### From within IPython
@@ -75,7 +92,10 @@ In [1]: %load_ext boa.ipython
         import boa
         boa.interpret.set_cache_dir()  # cache source compilations across sessions
 
-In [2]: %%vyper
+In [2]: %vyper msg.sender  # evaluate a vyper expression directly
+Out[2]: '0x0000000000000000000000000000000000000065'
+
+In [3]: %%vyper
    ...: 
    ...: MY_IMMUTABLE: immutable(uint256)
    ...: 
@@ -87,9 +107,9 @@ In [2]: %%vyper
    ...: def foo() -> uint256:
    ...:     return MY_IMMUTABLE
    ...: 
-Out[2]: <boa.contract.VyperDeployer at 0x7f3496187190>
+Out[3]: <boa.contract.VyperDeployer at 0x7f3496187190>
 
-In [3]: d = _
+In [4]: d = _
 
 In [4]: c = d.deploy(5)
 
@@ -117,7 +137,7 @@ Out[5]: 10
 1000000000000000101
 ```
 
-Note that in `eval()` mode, titanoboa uses different optimization settings, so gas usage may not be the same as using the external interface.
+Note that in `eval()` mode, titanoboa uses slightly different optimization settings, so gas usage may not be the same as using the external interface.
 
 basic tests:
 ```bash

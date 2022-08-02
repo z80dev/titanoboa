@@ -124,6 +124,75 @@ class TracingCodeStream(CodeStream):
         return self._length_cache
 
 
+# ### section: sha3 preimage tracing
+# (TODO: move to dedicated module)
+def to_int(value):
+    if isinstance(value, tuple):
+        return to_int(value[1])  # how py-evm stores stuff on stack
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        return int.from_bytes(value, "big")
+
+    raise ValueError("invalid type %s", type(value))
+
+
+def to_bytes(value):
+    if isinstance(value, tuple):
+        return to_bytes(value[1])  # how py-evm stores stuff on stack
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, int):
+        return value.to_bytes(32, "big")
+
+    raise ValueError("invalid type %s", type(value))
+
+
+class Sha3PreimageTracer:
+    # trace preimages of sha3
+
+    def __init__(self, sha3_op, preimage_map):
+        self.preimages = preimage_map
+        self.sha3 = sha3_op
+
+    def __call__(self, computation):
+        size, offset = [to_int(x) for x in computation._stack.values[-2:]]
+
+        # dispatch into py-evm
+        self.sha3(computation)
+
+        if size != 64:
+            return
+
+        preimage = computation._memory.read_bytes(offset, size)
+
+        image = to_bytes(computation._stack.values[-1])
+
+        self.preimages[image] = preimage
+
+
+class SstoreTracer:
+    def __init__(self, sstore_op, trace_db):
+        self.trace_db = trace_db
+        self.sstore = sstore_op
+
+    def __call__(self, computation):
+        value, slot = [to_bytes(t) for t in computation._stack.values[-2:]]
+        account = to_checksum_address(computation.msg.to)
+
+        self.trace_db.setdefault(account, set())
+        # we don't want to deal with snapshots/commits/reverts, so just
+        # register that the slot was touched and downstream can filter
+        # zero entries.
+        self.trace_db[account].add(slot)
+
+        # dispatch into py-evm
+        self.sstore(computation)
+
+
+# ### End section: sha3 tracing
+
+
 class TrivialGasMeter:
     def __init__(self, start_gas):
         self.start_gas = start_gas
@@ -172,7 +241,15 @@ class Env:
                 self._precompiles[CONSOLE_ADDRESS] = console_log
 
         # TODO make metering toggle-able
-        self.vm.state.computation_class = OpcodeTracingComputation
+        c = OpcodeTracingComputation
+
+        self.vm.state.computation_class = c
+
+        # patch in tracing opcodes
+        self.sha3_trace = {}
+        self.sstore_trace = {}
+        c.opcodes[0x20] = Sha3PreimageTracer(c.opcodes[0x20], self.sha3_trace)
+        c.opcodes[0x55] = SstoreTracer(c.opcodes[0x55], self.sstore_trace)
 
         self.vm.patch = VMPatcher(self.vm)
 

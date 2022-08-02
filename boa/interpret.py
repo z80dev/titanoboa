@@ -3,10 +3,10 @@ from typing import Optional, Union
 import vyper
 from vyper.compiler.phases import CompilerData
 
-from boa.contract import VyperContract, VyperDeployer, VyperFactory
+from boa.contract import BoaError, VyperBlueprint, VyperContract, VyperDeployer
 from boa.util.disk_cache import DiskCache
 
-_Contract = Union[VyperContract, VyperFactory]
+_Contract = Union[VyperContract, VyperBlueprint]
 
 
 _disk_cache = None
@@ -40,17 +40,16 @@ def load(filename: str, *args, **kwargs) -> _Contract:  # type: ignore
         return loads(f.read(), *args, name=filename, **kwargs)
 
 
-def loads(source_code, *args, as_factory=False, name=None, **kwargs):
+def loads(source_code, *args, as_blueprint=False, name=None, **kwargs):
     d = loads_partial(source_code, name)
-    if as_factory:
-        return d.deploy_as_factory(**kwargs)
+    if as_blueprint:
+        return d.deploy_as_blueprint(**kwargs)
     else:
         return d.deploy(*args, **kwargs)
 
 
 def loads_partial(source_code: str, name: Optional[str] = None) -> VyperDeployer:
-    if name is None:
-        name = "VyperContract"  # TODO handle this upstream in CompilerData
+    name = name or "VyperContract"  # TODO handle this upstream in CompilerData
     data = compiler_data(source_code, name)
     return VyperDeployer(data)
 
@@ -60,6 +59,4 @@ def load_partial(filename: str) -> VyperDeployer:  # type: ignore
         return loads_partial(f.read(), name=filename)
 
 
-def contract() -> _Contract:
-    # returns an empty contract
-    return loads("")
+__all__ = ["BoaError"]
