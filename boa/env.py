@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import sys
 from typing import Any, Iterator, Optional, Union
 
@@ -13,7 +14,14 @@ from eth.vm.opcode_values import STOP
 from eth.vm.transaction_context import BaseTransactionContext
 from eth_abi import decode_single
 from eth_typing import Address
-from eth_utils import to_canonical_address, to_checksum_address
+from eth_utils import setup_DEBUG2_logging, to_canonical_address, to_checksum_address
+
+
+def enable_pyevm_verbose_logging():
+    logging.basicConfig()
+    logger = logging.getLogger("eth.vm.computation.Computation")
+    setup_DEBUG2_logging()
+    logger.setLevel("DEBUG2")
 
 
 class VMPatcher:
@@ -149,6 +157,8 @@ def to_bytes(value):
 
 
 class Sha3PreimageTracer:
+    mnemonic = "SHA3"
+
     # trace preimages of sha3
 
     def __init__(self, sha3_op, preimage_map):
@@ -172,6 +182,8 @@ class Sha3PreimageTracer:
 
 
 class SstoreTracer:
+    mnemonic = "SSTORE"
+
     def __init__(self, sstore_op, trace_db):
         self.trace_db = trace_db
         self.sstore = sstore_op
@@ -220,8 +232,10 @@ class Env:
 
         self._address_counter = self.__class__._initial_address_counter
 
+        self._aliases = {}
+
         # TODO differentiate between origin and sender
-        self.eoa = self.generate_address()
+        self.eoa = self.generate_address("root")
 
         class OpcodeTracingComputation(self.vm.state.computation_class):
             _gas_metering = True
@@ -253,16 +267,22 @@ class Env:
 
         self.vm.patch = VMPatcher(self.vm)
 
-        self.contracts = {}
+        self._contracts = {}
 
     def set_gas_metering(self, val: bool) -> None:
         self.vm.state.computation_class._gas_metering = val
 
     def register_contract(self, address, obj):
-        self.contracts[to_checksum_address(address)] = obj
+        self._contracts[to_checksum_address(address)] = obj
 
     def lookup_contract(self, address):
-        return self.contracts.get(to_checksum_address(address))
+        return self._contracts.get(to_checksum_address(address))
+
+    def alias(self, address, name):
+        self._aliases[to_checksum_address(address)] = name
+
+    def lookup_alias(self, address):
+        return self._aliases[to_checksum_address(address)]
 
     # context manager which snapshots the state and reverts
     # to the snapshot on exiting the with statement
@@ -291,11 +311,16 @@ class Env:
             cls._singleton = cls()
         return cls._singleton
 
-    def generate_address(self) -> AddressT:
+    def generate_address(self, alias: Optional[str] = None) -> AddressT:
         self._address_counter += 1
         t = self._address_counter.to_bytes(length=20, byteorder="big")
         # checksum addr easier for humans to debug
-        return to_checksum_address(t)
+        ret = to_checksum_address(t)
+        if alias is not None:
+            self.alias(ret, alias)
+
+        return ret
+
 
     def deploy_code(
         self,
