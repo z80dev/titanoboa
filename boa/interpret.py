@@ -3,6 +3,8 @@ from typing import Optional, Union
 import vyper
 from vyper.compiler.phases import CompilerData
 
+import dasy
+
 from boa.contract import BoaError, VyperBlueprint, VyperContract, VyperDeployer
 from boa.util.disk_cache import DiskCache
 
@@ -42,6 +44,11 @@ def load(filename: str, *args, **kwargs) -> _Contract:  # type: ignore
 
 def loads(source_code, *args, as_blueprint=False, name=None, **kwargs):
     d = loads_partial(source_code, name)
+    if name is not None and name[-5:] == '.dasy':
+        dasy_ast = dasy.parse_src(source_code)
+        data = CompilerData(source_code, name, None, source_id=0)
+        data.vyper_module = dasy_ast
+        return VyperContract(data)
     if as_blueprint:
         return d.deploy_as_blueprint(**kwargs)
     else:

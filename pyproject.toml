@@ -16,6 +16,7 @@ classifiers = ["Topic :: Software Development"]
 # Requirements
 dependencies = [
     "hy @ git+https://github.com/hylang/hy.git@e375827a3603e33761810495a4b15a981178dc75 ",
+    "dasy >= 0.1.3",
     "vyper >= 0.3.6",
     "eth-abi",
     "py-evm",
