@@ -4,7 +4,8 @@ import contextlib
 import copy
 import textwrap
 import warnings
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import eth_abi as abi
 import vyper
@@ -13,6 +14,7 @@ import vyper.compiler.output as compiler_output
 import vyper.ir.compile_ir as compile_ir
 import vyper.semantics.namespace as vy_ns
 import vyper.semantics.validation as validation
+from eth.exceptions import VMError
 from eth_utils import to_canonical_address, to_checksum_address
 from vyper.ast.signatures.function_signature import FunctionSignature
 from vyper.ast.utils import parse_to_ast
@@ -28,10 +30,13 @@ from vyper.semantics.validation.utils import get_exact_type_from_node
 from vyper.utils import abi_method_id, cached_property
 
 from boa.env import AddressT, Env, to_int
+from boa.util.exceptions import strip_internal_frames
+from boa.vyper.ast_utils import reason_at
 from boa.vyper.decoder_utils import ByteAddressableStorage, decode_vyper_object
 
 
 # build a reverse map from the format we have in pc_pos_map to AST nodes
+# TODO move to ast_utils
 def ast_map_of(ast_node):
     ast_map = {}
     nodes = [ast_node] + ast_node.get_descendants(reverse=True)
@@ -42,6 +47,10 @@ def ast_map_of(ast_node):
 
 # error messages for external calls
 EXTERNAL_CALL_ERRORS = ("external call failed", "returndatasize too small")
+
+
+# error detail where user possibly provided dev revert reason
+DEV_REASON_ALLOWED = ("user raise", "user assert")
 
 
 # id used internally for method id name
@@ -143,9 +152,141 @@ class FrameDetail(dict):
         return f"<{self.fn_name}: {detail}>"
 
 
+@dataclass
+class DevReason:
+    reason_type: str
+    reason_str: str
+
+    @classmethod
+    def at(cls, source_code: str, lineno: int) -> Optional["DevReason"]:
+        s = reason_at(source_code, lineno)
+        if s is None:
+            return None
+        reason_type, reason_str = s
+        return cls(reason_type, reason_str)
+
+    def __str__(self):
+        return f"<{self.reason_type}: {self.reason_str}>"
+
+
+@dataclass
+class ErrorDetail:
+    vm_error: VMError
+    contract: "VyperContract"
+    error_detail: str  # compiler provided error detail
+    dev_reason: DevReason
+    frame_detail: FrameDetail
+    ast_source: vy_ast.VyperNode
+
+    @classmethod
+    def from_computation(cls, contract, computation):
+        error_detail = contract.find_error_meta(computation.code)
+        ast_source = contract.find_source_of(computation.code)
+        reason = DevReason.at(contract.compiler_data.source_code, ast_source.lineno)
+        frame_detail = contract.debug_frame(computation)
+
+        return cls(
+            vm_error=computation.error,
+            contract=contract,
+            error_detail=error_detail,
+            dev_reason=reason,
+            frame_detail=frame_detail,
+            ast_source=ast_source,
+        )
+
+    @property
+    def pretty_vm_reason(self):
+        err = self.vm_error
+        # decode error msg if it's "Error(string)"
+        # b"\x08\xc3y\xa0" == method_id("Error(string)")
+        if isinstance(err.args[0], bytes) and err.args[0][:4] == b"\x08\xc3y\xa0":
+            return abi.decode_single("(string)", err.args[0][4:])[0]
+
+        return repr(err)
+
+    def __str__(self):
+        msg = f"{self.contract}\n"
+
+        if self.error_detail is not None:
+            msg += f" <compiler: {self.error_detail}>"
+
+        if self.ast_source is not None:
+            # VyperException.__str__ does a lot of formatting for us
+            msg = str(VyperException(msg, self.ast_source))
+
+        if self.frame_detail is not None:
+            self.frame_detail.fn_name = "locals"  # override the displayed name
+            if len(self.frame_detail) > 0:
+                msg += f" {self.frame_detail}"
+
+        return msg
+
+
 class StackTrace(list):
-    def __repr__(self):
-        return "\n".join(repr(x) for x in self)
+    def __str__(self):
+        return "\n\n".join(str(x) for x in self)
+
+    @property
+    def last_frame(self):
+        return self[-1]
+
+
+# "pattern match" a BoaError. tries to match fields of the error
+# to the args/kwargs provided. raises if no match
+def check_boa_error_matches(error, *args, **kwargs):
+    assert isinstance(error, BoaError)
+
+    def _check(cond, msg=""):
+        if not cond:
+            raise ValueError(msg)
+
+    frame = error.stack_trace.last_frame
+    if len(args) > 0:
+        assert len(args) == 1, "multiple args!"
+        assert len(kwargs) == 0, "can't mix args and kwargs!"
+        err = args[0]
+        # try to match anything
+        _check(
+            err == frame.pretty_vm_reason
+            or err == frame.error_detail
+            or err == frame.dev_reason.reason_str,
+            "does not match {args}",
+        )
+        return
+
+    # try to match a specific kwarg
+    assert len(kwargs) == 1 and len(args) == 0
+
+    # don't accept magic
+    if frame.dev_reason:
+        assert frame.dev_reason.reason_type not in ("vm_error", "compiler")
+
+    k, v = next(iter(kwargs.items()))
+    if k == "compiler":
+        _check(v == frame.error_detail, f"{frame.error_detail} != {v}")
+    elif k == "vm_error":
+        _check(
+            frame.error_detail == "user revert with reason"
+            and v == frame.pretty_vm_reason,
+            f"{frame.vm_error} != {v}",
+        )
+    # assume it is a dev reason string
+    else:
+        assert_ast_types = (vy_ast.Assert, vy_ast.Raise)
+        if frame.ast_source.get_ancestor(assert_ast_types) is not None:
+            # if it's a dev reason on an assert statement, check that
+            # we are actually handling the user assertion and not some other
+            # error_detail.
+            _check(
+                frame.error_detail in DEV_REASON_ALLOWED,
+                f"expected <{k}: {v}> but got <compiler: {frame.error_detail}>",
+            )
+        _check(
+            frame.dev_reason is not None
+            and k == frame.dev_reason.reason_type
+            and v == frame.dev_reason.reason_str,
+            f"expected <{k}: {v}> but got {frame.dev_reason}",
+        )
 
 
 def unwrap_storage_key(sha3_db, k):
@@ -187,7 +328,7 @@ class VarModel:
     def _dealias(self, maybe_address):
         try:
             return self.contract.env.lookup_alias(maybe_address)
-        except:  # not found, return the input
+        except KeyError:  # not found, return the input
             return maybe_address
 
     def get(self):
@@ -267,7 +408,10 @@ class VyperContract(_BaseContract):
 
     # manually set the runtime bytecode, instead of using deploy
     def _set_bytecode(self, bytecode: bytes) -> None:
-        if bytecode[-self.data_section_size :] != self.compiler_data.bytecode_runtime:
+        to_check = bytecode
+        if self.data_section_size != 0:
+            to_check = bytecode[-self.data_section_size :]
+        if to_check != self.compiler_data.bytecode_runtime:
             warnings.warn(f"casted bytecode does not match compiled bytecode at {self}")
         self.bytecode = bytecode
 
@@ -358,53 +502,27 @@ class VyperContract(_BaseContract):
         return vyper_object(ret, vyper_typ)
 
     def handle_error(self, computation):
-        err = computation.error
-
-        # decode error msg if it's "Error(string)"
-        # b"\x08\xc3y\xa0" == method_id("Error(string)")
-        if isinstance(err.args[0], bytes) and err.args[0][:4] == b"\x08\xc3y\xa0":
-            err.args = (
-                abi.decode_single("(string)", err.args[0][4:])[0],
-                *err.args[1:],
-            )
-
-        error_msg = f"{repr(computation.error)} "
-
-        stack_trace = self.vyper_stack_trace(computation)
-
-        for (c, computation) in stack_trace:
-            error_msg += f"\n\n{c}\n"
-
-            error_detail = self.find_error_meta(computation.code)
-            if error_detail is not None:
-                error_msg += f" <dev: {error_detail}>"
-
-            ast_source = c.find_source_of(computation.code)
-            if ast_source is not None:
-                # VyperException.__str__ does a lot of formatting for us
-                error_msg = str(VyperException(error_msg, ast_source))
-
-            frame_detail = c.debug_frame(computation)
-            if frame_detail is not None:
-                frame_detail.fn_name = "locals"  # override the displayed name
-                if len(frame_detail) > 0:
-                    error_msg += f" {frame_detail}"
-
-        raise BoaError(error_msg)
+        try:
+            raise BoaError(self.vyper_stack_trace(computation))
+        except BoaError as b:
+            # modify the error so the traceback starts in userland.
+            # inspired by answers in https://stackoverflow.com/q/1603940/
+            raise strip_internal_frames(b) from None
 
     def vyper_stack_trace(self, computation):
-        ret = [(self, computation)]
+        ret = StackTrace([ErrorDetail.from_computation(self, computation)])
         error_detail = self.find_error_meta(computation.code)
         if error_detail not in EXTERNAL_CALL_ERRORS:
             return ret
-        if len(computation.children) < 1:
+        if len(computation.children) == 0:
             return ret
         if not computation.children[-1].is_error:
             return ret
+
         child = computation.children[-1]
         child_obj = self.env.lookup_contract(child.msg.code_address)
         child_trace = child_obj.vyper_stack_trace(child)
-        return child_trace + ret
+        return StackTrace(child_trace + ret)
 
     # eval vyper code in the context of this contract
     def eval(self, stmt: str) -> Any:
@@ -578,9 +696,15 @@ class VyperContract(_BaseContract):
         return sigs
 
 
-# inherit from VyperException for pretty tracebacks
-class BoaError(VyperException):
-    pass
+@dataclass
+class BoaError(Exception):
+    stack_trace: StackTrace
+
+    def __str__(self):
+        frame = self.stack_trace.last_frame
+        err = frame.vm_error
+        err.args = (frame.pretty_vm_reason, *err.args[1:])
+        return f"{err}\n\n{self.stack_trace}"
 
 
 class VyperFunction:
