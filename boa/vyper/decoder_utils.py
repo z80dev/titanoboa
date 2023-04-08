@@ -80,4 +80,4 @@ def decode_vyper_object(mem, typ):
             ofst += n
         return ret
 
-    return "unimplemented decoder for `{typ}`"
+    return f"unimplemented decoder for `{typ}`"
